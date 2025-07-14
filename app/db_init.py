@@ -1,6 +1,11 @@
 # backend/app/db_init.py
 import logging
 import os
+import sys
+
+# Add the project root to the Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from app.database import create_connection, get_db_path
 
 def init_db():
@@ -20,43 +25,34 @@ def init_db():
             logging.info("Database connection successful. Verifying tables...")
             cursor = conn.cursor()
             
-            # --- Create/Update agent_tasks table ---
+            # --- Create agent_tasks table if it doesn't exist ---
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_tasks (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                user_goal TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """)
+
+            # --- Add columns to agent_tasks if they don't exist ---
             cursor.execute("PRAGMA table_info(agent_tasks)")
             columns = [col[1] for col in cursor.fetchall()]
 
-            if not columns:
-                # Table does not exist, create it
-                cursor.execute("""
-                CREATE TABLE agent_tasks (
-                    id TEXT PRIMARY KEY,
-                    conversation_id TEXT NOT NULL,
-                    user_goal TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER,
-                    final_report TEXT,
-                    plan TEXT
-                )
-                """)
-                logging.info("Table 'agent_tasks' created.")
-            else:
-                # Table exists, add columns if they don't exist
-                if 'updated_at' not in columns:
-                    cursor.execute("ALTER TABLE agent_tasks ADD COLUMN updated_at INTEGER")
-                    logging.info("Column 'updated_at' added to 'agent_tasks'.")
-                if 'final_report' not in columns:
-                    cursor.execute("ALTER TABLE agent_tasks ADD COLUMN final_report TEXT")
-                    logging.info("Column 'final_report' added to 'agent_tasks'.")
-                if 'plan' not in columns:
-                    cursor.execute("ALTER TABLE agent_tasks ADD COLUMN plan TEXT")
-                    logging.info("Column 'plan' added to 'agent_tasks'.")
+            if 'updated_at' not in columns:
+                cursor.execute("ALTER TABLE agent_tasks ADD COLUMN updated_at INTEGER")
+                logging.info("Column 'updated_at' added to 'agent_tasks'.")
+            if 'final_report' not in columns:
+                cursor.execute("ALTER TABLE agent_tasks ADD COLUMN final_report TEXT")
+                logging.info("Column 'final_report' added to 'agent_tasks'.")
+            if 'plan' not in columns:
+                cursor.execute("ALTER TABLE agent_tasks ADD COLUMN plan TEXT")
+                logging.info("Column 'plan' added to 'agent_tasks'.")
 
             logging.info("Table 'agent_tasks' verified.")
             
             # --- Create agent_task_steps table ---
-            # This table structure is flexible enough for the new agent logic,
-            # so no changes are needed. It will store the sequence of thoughts,
-            # actions, and observations as they are dynamically generated.
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS agent_task_steps (
                 id TEXT PRIMARY KEY,
