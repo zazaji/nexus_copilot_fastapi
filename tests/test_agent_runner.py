@@ -58,87 +58,61 @@ class TestAgentRunner(unittest.TestCase):
         """Close the database connection after each test."""
         self.conn.close()
 
-    @patch('app.agents.runner.get_completion', new_callable=AsyncMock)
+    @patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock)
     @patch('app.agents.runner._execute_step', new_callable=AsyncMock)
-    def test_simple_task_execution(self, mock_execute_step, mock_get_completion):
+    def test_simple_task_execution(self, mock_execute_step, mock_generate_plan):
         """Test a simple task flow: search -> finish."""
 
         # --- Mock Setup ---
-        # 1. First LLM call decides to search
-        mock_get_completion.side_effect = [
-            json.dumps({
-                "thought": "I need to search for the goal.",
-                "action": "internet_search",
-                "action_input": {"query": "test goal"}
-            }),
-            # 2. Second LLM call decides to finish
-            json.dumps({
-                "thought": "I have the search results, I can now finish.",
-                "action": "FINISH",
-                "action_input": {"final_answer": "The answer is 42."}
-            })
+        goal = "test goal"
+        task_id = "test-task-1"
+        final_answer = "The answer is 42."
+        plan = [
+            {"sub_goal": "Search for the goal."},
+            {"sub_goal": "Finish the task."}
+        ]
+        mock_generate_plan.return_value = plan
+
+        mock_execute_step.side_effect = [
+            {"step_summary": "Search successful: Found relevant information.", "final_answer": None},
+            {"step_summary": "Task finished.", "final_answer": final_answer}
         ]
 
-        # Mock the execution of the search tool
-        mock_execute_step.return_value = "Search successful: Found relevant information."
-
         # --- Run the task ---
-        task_id = "test-task-1"
-        goal = "test goal"
-
-        # We need to run the async function _execute_task directly
         asyncio.run(_execute_task(self.conn, task_id, "conv-1", goal, self.api_config_dict))
 
         # --- Assertions ---
         # 1. Check final task status
         task = self.cursor.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
         self.assertEqual(task["status"], "completed")
-        self.assertEqual(task["final_report"], "The answer is 42.")
+        self.assertEqual(task["final_report"], final_answer)
 
         # 2. Check steps recorded in DB
         steps = self.cursor.execute("SELECT * FROM agent_task_steps WHERE task_id = ? ORDER BY step_index", (task_id,)).fetchall()
-        self.assertEqual(len(steps), 1)
-
-        step1 = steps[0]
-        self.assertEqual(step1["step_index"], 1)
-        self.assertEqual(step1["action"], "internet_search")
-        self.assertEqual(step1["observation"], "Search successful: Found relevant information.")
-        self.assertEqual(step1["status"], "completed")
-
-        # 3. Verify mocks were called correctly
-        self.assertEqual(mock_get_completion.call_count, 2)
-        mock_execute_step.assert_called_once_with("internet_search", {"query": "test goal"}, self.api_config)
+        self.assertEqual(len(steps), 2)
 
 
-    @patch('app.agents.runner.get_completion', new_callable=AsyncMock)
+    @patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock)
     @patch('app.agents.runner._execute_step', new_callable=AsyncMock)
-    def test_tool_error_handling(self, mock_execute_step, mock_get_completion):
+    def test_tool_error_handling(self, mock_execute_step, mock_generate_plan):
         """Test that the agent can handle a tool execution error."""
 
         # --- Mock Setup ---
-        # 1. First LLM call decides to use a tool
-        mock_get_completion.side_effect = [
-            json.dumps({
-                "thought": "I will try to run some python code.",
-                "action": "python_code_interpreter",
-                "action_input": {"code": "print(1/0)"} # This will cause an error
-            }),
-            # 2. Second LLM call sees the error and decides to finish
-            json.dumps({
-                "thought": "The python code failed to execute. I cannot proceed and will report the failure.",
-                "action": "FINISH",
-                "action_input": {"final_answer": "Failed to execute Python code with error: Division by zero."}
-            })
+        goal = "run bad python code"
+        task_id = "test-task-2"
+        final_answer = "Failed to execute Python code with error: division by zero."
+        plan = [
+            {"sub_goal": "Run some python code that will fail."},
+            {"sub_goal": "Finish the task."}
+        ]
+        mock_generate_plan.return_value = plan
+
+        mock_execute_step.side_effect = [
+            {"step_summary": "Error executing tool 'python_code_interpreter': division by zero.", "final_answer": None},
+            {"step_summary": "Task finished.", "final_answer": final_answer}
         ]
 
-        # Mock the execution of the tool to return an error message
-        error_message = "Error executing tool 'python_code_interpreter': division by zero. Please check your action_input."
-        mock_execute_step.return_value = error_message
-
         # --- Run the task ---
-        task_id = "test-task-2"
-        goal = "run bad python code"
-
         asyncio.run(_execute_task(self.conn, task_id, "conv-2", goal, self.api_config_dict))
 
         # --- Assertions ---
@@ -149,89 +123,147 @@ class TestAgentRunner(unittest.TestCase):
 
         # 2. Check the step that failed
         steps = self.cursor.execute("SELECT * FROM agent_task_steps WHERE task_id = ?", (task_id,)).fetchall()
-        self.assertEqual(len(steps), 1)
-
-        failed_step = steps[0]
-        self.assertEqual(failed_step["action"], "python_code_interpreter")
-        self.assertEqual(failed_step["observation"], error_message)
-        self.assertEqual(failed_step["status"], "completed") # The step itself completes, but the observation contains the error
-
-        # 3. Verify mocks
-        self.assertEqual(mock_get_completion.call_count, 2)
-        mock_execute_step.assert_called_once()
+        self.assertEqual(len(steps), 2)
 
 
-    @patch('app.agents.runner.get_completion', new_callable=AsyncMock)
+    @patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock)
     @patch('app.agents.runner._execute_step', new_callable=AsyncMock)
-    def test_multi_step_report_generation(self, mock_execute_step, mock_get_completion):
+    def test_multi_step_report_generation(self, mock_execute_step, mock_generate_plan):
         """Test a more complex flow involving multi-step report generation."""
 
         # --- Mock Setup ---
+        goal = "write a report"
+        task_id = "test-task-3"
         outline = ["Chapter 1: Introduction", "Chapter 2: Conclusion"]
         chapter1_content = "This is the introduction."
         chapter2_content = "This is the conclusion."
         final_report_content = f"# Report\n\n## Chapter 1: Introduction\n{chapter1_content}\n\n## Chapter 2: Conclusion\n{chapter2_content}"
-
-        mock_get_completion.side_effect = [
-            # 1. Decide to generate an outline
-            json.dumps({
-                "thought": "I need to create a report. I will start with an outline.",
-                "action": "generate_report_outline",
-                "action_input": {"goal": "write a report"}
-            }),
-            # 2. Decide to write chapter 1
-            json.dumps({
-                "thought": "Outline is ready. I will write the first chapter.",
-                "action": "write_report_chapter",
-                "action_input": {"goal": "write a report", "outline": outline, "chapter_title": "Chapter 1: Introduction"}
-            }),
-            # 3. Decide to write chapter 2
-            json.dumps({
-                "thought": "First chapter is done. Now for the second chapter.",
-                "action": "write_report_chapter",
-                "action_input": {"goal": "write a report", "outline": outline, "chapter_title": "Chapter 2: Conclusion", "previous_chapters": chapter1_content}
-            }),
-            # 4. Decide to save the final report
-            json.dumps({
-                "thought": "All chapters are written. I will now save the consolidated report.",
-                "action": "save_to_knowledge_base",
-                "action_input": {"filename": "final_report.md", "content": final_report_content}
-            }),
-            # 5. Finish the task
-            json.dumps({
-                "thought": "The report has been saved.",
-                "action": "FINISH",
-                "action_input": {"final_answer": "Successfully generated and saved the report."}
-            })
+        final_answer = "Successfully generated and saved the report."
+        plan = [
+            {"sub_goal": "Generate an outline for the report."},
+            {"sub_goal": "Write the first chapter."},
+            {"sub_goal": "Write the second chapter."},
+            {"sub_goal": "Save the final report."},
+            {"sub_goal": "Finish the task."}
         ]
+        mock_generate_plan.return_value = plan
 
         mock_execute_step.side_effect = [
-            json.dumps(outline),
-            chapter1_content,
-            chapter2_content,
-            "Success: File 'final_report.md' saved.",
+            {"step_summary": f"Sub-goal: Generate an outline for the report.\nOutcome: {json.dumps(outline)}", "final_answer": None},
+            {"step_summary": f"Sub-goal: Write the first chapter.\nOutcome: {chapter1_content}", "final_answer": None},
+            {"step_summary": f"Sub-goal: Write the second chapter.\nOutcome: {chapter2_content}", "final_answer": None},
+            {"step_summary": "Sub-goal: Save the final report.\nOutcome: Success: File 'final_report.md' saved.", "final_answer": None},
+            {"step_summary": "Task finished.", "final_answer": final_answer}
         ]
 
         # --- Run the task ---
-        task_id = "test-task-3"
-        goal = "write a report"
         asyncio.run(_execute_task(self.conn, task_id, "conv-3", goal, self.api_config_dict))
 
         # --- Assertions ---
         task = self.cursor.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
         self.assertEqual(task["status"], "completed")
-        self.assertEqual(task["final_report"], "Successfully generated and saved the report.")
+        self.assertEqual(task["final_report"], final_answer)
 
         steps = self.cursor.execute("SELECT * FROM agent_task_steps WHERE task_id = ? ORDER BY step_index", (task_id,)).fetchall()
-        self.assertEqual(len(steps), 4)
+        self.assertEqual(len(steps), 5)
 
-        self.assertEqual(steps[0]["action"], "generate_report_outline")
-        self.assertEqual(steps[1]["action"], "write_report_chapter")
-        self.assertEqual(steps[2]["action"], "write_report_chapter")
-        self.assertEqual(steps[3]["action"], "save_to_knowledge_base")
 
-        self.assertEqual(mock_get_completion.call_count, 5)
-        self.assertEqual(mock_execute_step.call_count, 4)
+    def test_complex_investment_report(self):
+        """
+        Test a complex task of generating an investment report,
+        covering the full planner -> executor -> tool -> report flow.
+        """
+        goal = "请查找中国股市酒类相关股票的股价和其他相关研报，然后给出详细的投资分析报告。"
+        task_id = "investment-report-task"
+
+        # --- Mock Data ---
+        search_results = "茅台股价：2000元，五粮液股价：300元。研报摘要：酒类市场前景广阔..."
+        analyzed_data = "分析结果：茅台和五粮液是龙头企业，具有长期投资价值。"
+        outline = ["1. 行业概览", "2. 重点公司分析", "3. 投资建议"]
+        chapter1 = "第一章内容..."
+        chapter2 = "第二章内容..."
+        chapter3 = "第三章内容..."
+        final_report = f"# 投资分析报告\n\n## 1. 行业概览\n{chapter1}\n\n## 2. 重点公司分析\n{chapter2}\n\n## 3. 投资建议\n{chapter3}"
+
+        # --- Mock LLM Calls ---
+        # 1. Planner's response (the plan)
+        planner_response = {
+            "plan": [
+                {"sub_goal": "使用互联网搜索查找中国股市酒类相关股票的最新股价。"},
+                {"sub_goal": "使用互联网搜索查找相关的行业研究报告。"},
+                {"sub_goal": "综合搜索结果，分析市场趋势和重点公司。"},
+                {"sub_goal": "为投资报告生成一个大纲，包括行业概览、重点公司分析和投资建议。"},
+                {"sub_goal": "撰写'行业概览'章节。"},
+                {"sub_goal": "撰写'重点公司分析'章节。"},
+                {"sub_goal": "撰写'投资建议'章节。"},
+                {"sub_goal": f"将所有章节合并成最终报告，并调用 finish_task 工具。"},
+            ]
+        }
+
+        # Executor's responses for each sub-goal
+        executor_responses = [
+            # Step 1: Search stock prices
+            {"thought": "...", "action": "internet_search", "action_input": {"query": "中国股市酒类股票股价"}},
+            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
+            # Step 2: Search research papers
+            {"thought": "...", "action": "internet_search", "action_input": {"query": "中国酒类股票行业研究报告"}},
+            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
+            # Step 3: Analyze data
+            {"thought": "...", "action": "python_code_interpreter", "action_input": {"code": "print('分析结果...')"}},
+            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
+            # Step 4: Generate outline
+            {"thought": "...", "action": "generate_report_outline", "action_input": {"goal": goal}},
+            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
+            # Step 5: Write chapter 1
+            {"thought": "...", "action": "write_report_chapter", "action_input": {"chapter_title": "1. 行业概览"}},
+            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
+            # Step 6: Write chapter 2
+            {"thought": "...", "action": "write_report_chapter", "action_input": {"chapter_title": "2. 重点公司分析"}},
+            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
+            # Step 7: Write chapter 3
+            {"thought": "...", "action": "write_report_chapter", "action_input": {"chapter_title": "3. 投资建议"}},
+            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
+             # Step 8: Finish
+            {"thought": "...", "action": "finish_task", "action_input": {"final_answer": final_report}},
+        ]
+
+
+        # --- Patching ---
+        with patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock) as mock_generate_plan, \
+             patch('app.agents.runner._determine_next_action_for_sub_goal', new_callable=AsyncMock) as mock_determine_action, \
+             patch('app.agents.runner._execute_tool', new_callable=AsyncMock) as mock_execute_tool:
+
+            # Setup mock return values
+            mock_generate_plan.return_value = planner_response["plan"]
+            mock_determine_action.side_effect = executor_responses
+            mock_execute_tool.side_effect = [
+                search_results, # For step 1
+                search_results, # For step 2
+                analyzed_data,  # For step 3
+                json.dumps(outline), # For step 4
+                chapter1, # For step 5
+                chapter2, # For step 6
+                chapter3, # For step 7
+                final_report # for step 8
+            ]
+
+            # --- Run Task ---
+            asyncio.run(_execute_task(self.conn, task_id, "conv-complex", goal, self.api_config_dict))
+
+            # --- Assertions ---
+            # 1. Final task status
+            task = self.cursor.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["final_report"], final_report)
+
+            # 2. Check number of steps in DB
+            steps = self.cursor.execute("SELECT * FROM agent_task_steps WHERE task_id = ?", (task_id,)).fetchall()
+            self.assertEqual(len(steps), len(planner_response["plan"]))
+
+            # 3. Verify calls
+            mock_generate_plan.assert_called_once_with(goal, self.api_config)
+            self.assertEqual(mock_determine_action.call_count, len(executor_responses))
+            self.assertEqual(mock_execute_tool.call_count, 8) # 8 tools were called
 
 
 if __name__ == '__main__':
