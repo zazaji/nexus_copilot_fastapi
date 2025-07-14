@@ -350,3 +350,42 @@ async def search(req: SearchRequest):
     except Exception as e:
         logger.error(f"Tavily search failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Search service failed.")
+
+async def get_completion(messages: List[Dict[str, str]], api_config: ApiConfig) -> str:
+    """
+    Gets a non-streamed completion from the LLM.
+    """
+    chat_assignment = api_config.assignments.chat
+    if not chat_assignment:
+        raise HTTPException(status_code=400, detail="Chat model is not configured in settings.")
+
+    chat_provider = next((p for p in api_config.providers if p.id == chat_assignment.providerId), None)
+    if not chat_provider:
+        raise HTTPException(status_code=400, detail=f"Provider for chat model not found: {chat_assignment.providerId}")
+
+    provider_config = ProviderConfig(
+        base_url=chat_provider.baseUrl,
+        api_key=chat_provider.apiKey,
+        proxy=chat_provider.proxy
+    )
+
+    target_url = f"{provider_config.base_url.strip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {provider_config.api_key}", "Content-Type": "application/json"}
+    forward_data = {"model": chat_assignment.modelName, "messages": messages, "stream": False}
+
+    client = get_client(provider_config.proxy)
+    try:
+        response = await client.post(target_url, headers=headers, json=forward_data)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except httpx.HTTPStatusError as e:
+        error_content = e.response.text
+        logger.error(f"HTTP Status Error from target API: {e.response.status_code} - {error_content}", exc_info=True)
+        raise HTTPException(status_code=e.response.status_code, detail=f"Error from target API: {error_content}")
+    except Exception as e:
+        logger.error(f"Unhandled exception in get_completion: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
+    finally:
+        if provider_config.proxy:
+            await client.aclose()
