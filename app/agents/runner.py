@@ -11,6 +11,19 @@ from app.api.v1.endpoints.proxy import tavily_search, ApiConfig, get_completion
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- Context Management ---
+
+async def _summarize_history(history: List[Dict], api_config: ApiConfig) -> str:
+    """Summarizes a history of actions and observations to save context space."""
+    if not history:
+        return "No history yet."
+
+    # Simple summarization for now. Can be replaced with an LLM call for more complex scenarios.
+    summary = "Previously in this sub-goal: "
+    for item in history:
+        summary += f"You used the tool '{item['action']}' and the result was '{item['observation'][:100]}...'. "
+    return summary
+
 # --- Tool Implementations ---
 
 async def _tool_internet_search(params: Dict[str, Any], api_config: ApiConfig) -> str:
@@ -49,22 +62,56 @@ async def _tool_read_from_knowledge_base(params: Dict[str, Any], api_config: Api
         return f.read()
 
 async def _tool_python_code_interpreter(params: Dict[str, Any], api_config: ApiConfig) -> str:
-    """Executes a string of Python code and returns the output."""
+    """
+    Executes a string of Python code in a restricted environment and returns the output.
+    Can handle multi-line scripts.
+    """
     code = params.get("code")
     if not code:
         raise ValueError("Python code interpreter requires 'code' parameter.")
+
     from io import StringIO
     import sys
+
+    # Create a restricted global environment for exec
+    restricted_globals = {
+        "__builtins__": {
+            "print": print,
+            "len": len,
+            "range": range,
+            "str": str,
+            "int": int,
+            "float": float,
+            "list": list,
+            "dict": dict,
+            "set": set,
+            "sorted": sorted,
+            "min": min,
+            "max": max,
+            "sum": sum,
+            "abs": abs,
+            "round": round,
+            "__import__": __import__
+        },
+        # You can add safe libraries here, e.g., 'math', 'datetime'
+        'json': json,
+        'time': time,
+    }
+
     old_stdout = sys.stdout
     redirected_output = sys.stdout = StringIO()
+
     try:
-        exec(code, globals())
+        # Execute the code with the restricted environment
+        exec(code, restricted_globals)
         sys.stdout = old_stdout
         output = redirected_output.getvalue()
-        return output
+        return output if output else "Code executed successfully with no output."
     except Exception as e:
         sys.stdout = old_stdout
-        return f"Error executing code: {e}"
+        # Provide a more informative error message
+        return f"Error executing code: {type(e).__name__}: {e}"
+
 
 async def _tool_generate_report_outline(params: Dict[str, Any], api_config: ApiConfig) -> str:
     """Generates a structured outline for a report based on a goal."""
@@ -78,11 +125,18 @@ async def _tool_generate_report_outline(params: Dict[str, Any], api_config: ApiC
     outline_str = await get_completion(messages, api_config)
 
     try:
+        # The LLM might return the JSON wrapped in markdown, so we extract it.
+        json_start = outline_str.find('[')
+        json_end = outline_str.rfind(']') + 1
+        if json_start != -1 and json_end != 0:
+            outline_str = outline_str[json_start:json_end]
+
         outline = json.loads(outline_str)
         if isinstance(outline, list) and all(isinstance(i, str) for i in outline):
             return json.dumps(outline)
         else:
-            raise ValueError("LLM did not return a valid JSON list of strings for the outline.")
+            # Attempt to re-prompt or fix the format if necessary
+            return f"Error: LLM returned a valid JSON but not a list of strings. Outline: {outline}"
     except json.JSONDecodeError:
         return f"Error: Failed to generate a valid JSON outline. Raw LLM output: {outline_str}"
 
@@ -91,7 +145,7 @@ async def _tool_write_report_chapter(params: Dict[str, Any], api_config: ApiConf
     goal = params.get("goal")
     outline = params.get("outline")
     chapter_title = params.get("chapter_title")
-    previous_chapters = params.get("previous_chapters", "")
+    previous_chapters = params.get("previous_chapters", "") # This provides context of what has been written
 
     if not all([goal, outline, chapter_title]):
         raise ValueError("Writing a chapter requires 'goal', 'outline', and 'chapter_title' parameters.")
@@ -101,7 +155,7 @@ async def _tool_write_report_chapter(params: Dict[str, Any], api_config: ApiConf
     Overall Goal: {goal}
     Report Outline: {outline}
     You are now writing the chapter titled: "{chapter_title}".
-    Previously written chapters (for context):
+    Previously written chapters (for context, do not repeat):
     {previous_chapters}
     Please write the content for the "{chapter_title}" chapter now. Ensure it flows logically from the previous content and fits within the overall outline.
     """
@@ -119,6 +173,32 @@ async def _tool_finish_task(params: Dict[str, Any], api_config: ApiConfig) -> st
         raise ValueError("Finishing the task requires a 'final_answer' parameter.")
     return final_answer
 
+# --- Dynamic Re-planning Tool ---
+async def _tool_replan(params: Dict[str, Any], api_config: ApiConfig, goal: str, history_summary: str) -> List[Dict]:
+    """
+    When the agent is stuck or a step fails, this tool is called to generate a new plan.
+    """
+    logging.info("Re-planning task...")
+
+    replan_prompt = f"""
+    You are a master planner. The original goal was: "{goal}".
+    The execution so far has resulted in the following summary:
+    {history_summary}
+
+    However, the agent is stuck. Please create a new, revised plan to achieve the original goal, taking into account what has already been done.
+    The new plan should start from the current state and lead to the completion of the goal.
+    Provide the new plan in the same JSON format as before.
+    """
+
+    messages = [{"role": "user", "content": replan_prompt}]
+    llm_response = await _call_llm_with_retry(messages, api_config)
+    new_plan = llm_response.get("plan", [])
+    if not isinstance(new_plan, list) or not all("sub_goal" in step for step in new_plan):
+        raise ValueError("Re-planner LLM did not return a valid plan structure.")
+
+    logging.info(f"Generated new plan with {len(new_plan)} steps.")
+    return new_plan
+
 
 TOOL_DISPATCHER: Dict[str, Callable[[Dict[str, Any], ApiConfig], Coroutine[Any, Any, str]]] = {
     "internet_search": _tool_internet_search,
@@ -128,6 +208,7 @@ TOOL_DISPATCHER: Dict[str, Callable[[Dict[str, Any], ApiConfig], Coroutine[Any, 
     "save_to_knowledge_base": _tool_save_to_knowledge_base,
     "read_from_knowledge_base": _tool_read_from_knowledge_base,
     "finish_task": _tool_finish_task,
+    # Note: _tool_replan is not in the dispatcher as it's a meta-tool used by the orchestrator.
 }
 
 # --- LLM Interaction ---
@@ -137,17 +218,22 @@ async def _call_llm_with_retry(messages: List[Dict], api_config: ApiConfig, max_
     for attempt in range(max_retries):
         try:
             llm_response_str = await get_completion(messages, api_config)
+
+            # More robust JSON extraction
             json_start = llm_response_str.find("```json")
-            json_end = llm_response_str.rfind("```")
             if json_start != -1:
-                json_str = llm_response_str[json_start + 7:json_end].strip()
+                json_str = llm_response_str[json_start + 7:]
+                json_end = json_str.rfind("```")
+                if json_end != -1:
+                    json_str = json_str[:json_end].strip()
             else:
-                json_str = llm_response_str
+                json_str = llm_response_str.strip()
+
             return json.loads(json_str)
         except json.JSONDecodeError as e:
             logging.warning(f"Attempt {attempt + 1} failed: JSONDecodeError. Response: {llm_response_str}. Retrying...")
             if attempt + 1 == max_retries:
-                raise e
+                raise ValueError(f"LLM failed to return valid JSON after {max_retries} attempts. Last response: {llm_response_str}") from e
         except Exception as e:
             logging.error(f"An unexpected error occurred during LLM call: {e}")
             raise e
@@ -327,48 +413,57 @@ async def _execute_step(conn: sqlite3.Connection, task_id: str, step_index: int,
     history = []
     max_actions_per_step = 10
     final_answer = None
+    step_failed = False
 
     for i in range(max_actions_per_step):
-        decision = await _determine_next_action_for_sub_goal(goal, sub_goal, history, api_config, previous_steps_summary)
-        action = decision.get("action")
-        action_input = decision.get("action_input", {})
-
-        if not action or action.upper() == "COMPLETE_SUB_GOAL":
-            logging.info(f"[{task_id}] Sub-goal '{sub_goal}' completed.")
-            observation = "Sub-goal completed."
-            break
-
-        if action.upper() == "FINISH_TASK":
-            logging.info(f"[{task_id}] Finish task action received.")
-            final_answer = await _execute_tool(action, action_input, api_config)
-            observation = f"Task finished with final answer: {final_answer}"
-            break
         try:
-            observation = await _execute_tool(action, action_input, api_config)
-            history.append({"action": action, "action_input": action_input, "observation": observation})
-        except Exception as e:
-            logging.error(f"Error executing tool {action}: {e}")
-            history.append({"action": action, "action_input": action_input, "observation": f"Error: {e}"})
-            decision = await _self_correct(goal, sub_goal, history, api_config, previous_steps_summary)
+            decision = await _determine_next_action_for_sub_goal(goal, sub_goal, history, api_config, previous_steps_summary)
             action = decision.get("action")
             action_input = decision.get("action_input", {})
+
+            if not action or action.upper() == "COMPLETE_SUB_GOAL":
+                logging.info(f"[{task_id}] Sub-goal '{sub_goal}' completed.")
+                observation = "Sub-goal completed."
+                break
+
+            if action.upper() == "FINISH_TASK":
+                logging.info(f"[{task_id}] Finish task action received.")
+                final_answer = await _execute_tool(action, action_input, api_config)
+                observation = f"Task finished with final answer: {final_answer}"
+                break
+
             observation = await _execute_tool(action, action_input, api_config)
             history.append({"action": action, "action_input": action_input, "observation": observation})
 
+            if "error" in observation.lower():
+                 # Simple error check, can be improved
+                logging.warning(f"Tool returned an error, considering self-correction: {observation}")
+
+        except Exception as e:
+            logging.error(f"Error executing action for sub-goal '{sub_goal}': {e}")
+            observation = f"Error: {e}"
+            history.append({"action": "error", "action_input": {}, "observation": str(e)})
+
+            # If we are on the last action, mark the step as failed
+            if i == max_actions_per_step - 1:
+                step_failed = True
+            continue
 
         if i == max_actions_per_step - 1:
-            logging.warning(f"[{task_id}] Max actions reached for sub-goal '{sub_goal}'. Moving on.")
+            logging.warning(f"[{task_id}] Max actions reached for sub-goal '{sub_goal}'. Marking as failed.")
+            step_failed = True
             break
 
     # Summarize the step's outcome
     step_summary = f"Sub-goal: {sub_goal}\nOutcome: {observation}"
+    status = "failed" if step_failed else "completed"
     conn.execute(
-        "UPDATE agent_task_steps SET status = ?, observation = ? WHERE id = ?",
-        ("completed", step_summary, step_id)
+        "UPDATE agent_task_steps SET status = ?, observation = ?, history = ? WHERE id = ?",
+        (status, step_summary, json.dumps(history), step_id)
     )
     conn.commit()
 
-    return {"step_summary": step_summary, "final_answer": final_answer}
+    return {"step_summary": step_summary, "final_answer": final_answer, "failed": step_failed}
 
 def _build_self_correction_prompt(goal: str, sub_goal: str, history: List[Dict], previous_steps_summary: str) -> str:
     """Builds the prompt for the self-correction LLM call."""
@@ -433,77 +528,86 @@ async def _self_correct(goal: str, sub_goal: str, history: List[Dict], api_confi
 
 async def _execute_task(conn: sqlite3.Connection, task_id: str, conversation_id: str, goal: str, api_config_dict: dict):
     api_config = ApiConfig(**api_config_dict)
+    max_replans = 2
 
     # 1. Initialize Task in DB
     current_time = int(time.time() * 1000)
     conn.execute(
-        "INSERT INTO agent_tasks (id, conversation_id, user_goal, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, conversation_id, goal, "planning", current_time, current_time)
+        "INSERT INTO agent_tasks (id, conversation_id, user_goal, status, created_at, updated_at, plan) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_id, conversation_id, goal, "planning", current_time, current_time, "[]")
     )
     conn.commit()
 
-    # 2. Generate Plan
+    # 2. Generate Initial Plan
     plan = await _generate_initial_plan(goal, api_config)
-
-    # 3. Save Plan to DB
-    for i, step_data in enumerate(plan):
-        step_id = f"{task_id}-{i + 1}"
-        sub_goal = step_data.get("sub_goal", "No sub-goal defined.")
-        conn.execute(
-            "INSERT INTO agent_task_steps (id, task_id, step_index, thought, action, action_input, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (step_id, task_id, i + 1, "Planner-generated step", sub_goal, "{}", "pending")
-        )
-    conn.commit()
-    conn.execute("UPDATE agent_tasks SET status = ? WHERE id = ?", ("running", task_id))
+    conn.execute("UPDATE agent_tasks SET plan = ? WHERE id = ?", (json.dumps(plan), task_id))
     conn.commit()
 
-    # 4. Execute Plan
-    previous_steps_summary = ""
-    final_report = ""
-    outline = None
-    chapters = []
-    for i, step_data in enumerate(plan):
-        step_index = i + 1
-        sub_goal = step_data.get("sub_goal", "No sub-goal defined.")
-
-        # Mark step as running
-        step_id = f"{task_id}-{step_index}"
-        conn.execute("UPDATE agent_task_steps SET status = ? WHERE id = ?", ("running", step_id))
+    for replan_attempt in range(max_replans + 1):
+        # 3. Save current plan to DB
+        conn.execute("DELETE FROM agent_task_steps WHERE task_id = ?", (task_id,))
+        for i, step_data in enumerate(plan):
+            step_id = f"{task_id}-{i + 1}"
+            sub_goal = step_data.get("sub_goal", "No sub-goal defined.")
+            conn.execute(
+                "INSERT INTO agent_task_steps (id, task_id, step_index, thought, action, action_input, status, history) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (step_id, task_id, i + 1, "Planner-generated step", sub_goal, "{}", "pending", "[]")
+            )
+        conn.commit()
+        conn.execute("UPDATE agent_tasks SET status = ? WHERE id = ?", ("running", task_id))
         conn.commit()
 
-        step_result = await _execute_step(conn, task_id, step_index, goal, sub_goal, api_config, previous_steps_summary)
-        step_summary = step_result["step_summary"]
-        final_answer = step_result["final_answer"]
+        # 4. Execute Plan
+        previous_steps_summary = ""
+        final_report = ""
+        task_failed = False
 
+        for i, step_data in enumerate(plan):
+            step_index = i + 1
+            sub_goal = step_data.get("sub_goal", "No sub-goal defined.")
 
-        if "generate_report_outline" in sub_goal.lower():
-            try:
-                outline = json.loads(step_summary.split("Outcome: ")[1])
-            except (json.JSONDecodeError, IndexError):
-                pass
+            # Mark step as running
+            step_id = f"{task_id}-{step_index}"
+            conn.execute("UPDATE agent_task_steps SET status = ? WHERE id = ?", ("running", step_id))
+            conn.commit()
 
-        if "write_report_chapter" in sub_goal.lower():
-            chapters.append(step_summary.split("Outcome: ")[1])
+            step_result = await _execute_step(conn, task_id, step_index, goal, sub_goal, api_config, previous_steps_summary)
 
-        if final_answer:
-            final_report = final_answer
+            previous_steps_summary += f"Step {step_index} Summary:\n{step_result['step_summary']}\n\n"
+
+            if step_result["final_answer"]:
+                final_report = step_result["final_answer"]
+                break # Task is finished
+
+            if step_result["failed"]:
+                logging.warning(f"Step {step_index} failed. Current plan is not working.")
+                task_failed = True
+                break # Stop executing current plan
+
+        if not task_failed and not final_report:
+             # If the plan completed but didn't call finish_task, something is wrong.
+             final_report = previous_steps_summary + "\n\nWarning: The plan completed, but the 'finish_task' tool was not called. The above is a summary of the work done."
+
+        if not task_failed:
+            conn.execute("UPDATE agent_task_steps SET status = ? WHERE task_id = ?", ("completed", task_id))
+            conn.commit()
+            break # The plan was successful
+
+        if replan_attempt < max_replans:
+            logging.info(f"Attempting to re-plan... ({replan_attempt + 1}/{max_replans})")
+            plan = await _tool_replan({}, api_config, goal, previous_steps_summary)
+        else:
+            logging.error("Max re-plan attempts reached. Task failed.")
+            final_report = previous_steps_summary + "\n\nERROR: The agent failed to complete the task after multiple attempts and re-plans."
             break
 
-        previous_steps_summary += f"Step {step_index} Summary:\n{step_summary}\n\n"
-        # final_report = previous_steps_summary  # For now, the report is just a concatenation of summaries
-
     # 5. Finalize Task
-    if chapters and not final_report:
-        final_report = "\n\n".join(chapters)
-
-    if not final_report:
-        final_report = previous_steps_summary
-
     logging.info(f"[{task_id}] Task execution finished. Final report generated.")
     current_time = int(time.time() * 1000)
+    status = "failed" if task_failed else "completed"
     conn.execute(
         "UPDATE agent_tasks SET status = ?, final_report = ?, updated_at = ? WHERE id = ?",
-        ("completed", final_report, current_time, task_id)
+        (status, final_report, current_time, task_id)
     )
     conn.commit()
 

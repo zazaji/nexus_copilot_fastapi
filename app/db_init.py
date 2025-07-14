@@ -34,7 +34,8 @@ def init_db():
                     status TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER,
-                    final_report TEXT
+                    final_report TEXT,
+                    plan TEXT
                 )
                 """)
                 logging.info("Table 'agent_tasks' created.")
@@ -46,6 +47,9 @@ def init_db():
                 if 'final_report' not in columns:
                     cursor.execute("ALTER TABLE agent_tasks ADD COLUMN final_report TEXT")
                     logging.info("Column 'final_report' added to 'agent_tasks'.")
+                if 'plan' not in columns:
+                    cursor.execute("ALTER TABLE agent_tasks ADD COLUMN plan TEXT")
+                    logging.info("Column 'plan' added to 'agent_tasks'.")
 
             logging.info("Table 'agent_tasks' verified.")
             
@@ -63,6 +67,7 @@ def init_db():
                 action_input TEXT NOT NULL,
                 observation TEXT,
                 status TEXT NOT NULL,
+                history TEXT,
                 FOREIGN KEY (task_id) REFERENCES agent_tasks (id) ON DELETE CASCADE
             )
             """)

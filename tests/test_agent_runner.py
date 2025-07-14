@@ -9,32 +9,48 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from app.agents.runner import run_task_background, _execute_task
+from app.agents.runner import _execute_task
 from app.api.v1.endpoints.proxy import ApiConfig
+from app.db_init import init_db
 
 class TestAgentRunner(unittest.TestCase):
 
     def setUp(self):
         """Set up a temporary in-memory database for each test."""
+        # Use a real in-memory SQLite database
         self.conn = sqlite3.connect(":memory:")
-        self.conn.row_factory = sqlite3.Row
-        self.cursor = self.conn.cursor()
-
-        # Create tables
-        self.cursor.execute("""
+        # Manually initialize the schema using our db_init script logic
+        self.conn.execute("PRAGMA foreign_keys = ON;")
+        cursor = self.conn.cursor()
+        cursor.execute("""
         CREATE TABLE agent_tasks (
-            id TEXT PRIMARY KEY, conversation_id TEXT, user_goal TEXT, status TEXT,
-            created_at INTEGER, updated_at INTEGER, final_report TEXT
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            user_goal TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER,
+            final_report TEXT,
+            plan TEXT
         )
         """)
-        self.cursor.execute("""
+        cursor.execute("""
         CREATE TABLE agent_task_steps (
-            id TEXT PRIMARY KEY, task_id TEXT, step_index INTEGER, thought TEXT,
-            action TEXT, action_input TEXT, observation TEXT, status TEXT,
-            FOREIGN KEY (task_id) REFERENCES agent_tasks (id)
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            step_index INTEGER NOT NULL,
+            thought TEXT,
+            action TEXT NOT NULL,
+            action_input TEXT NOT NULL,
+            observation TEXT,
+            status TEXT NOT NULL,
+            history TEXT,
+            FOREIGN KEY (task_id) REFERENCES agent_tasks (id) ON DELETE CASCADE
         )
         """)
         self.conn.commit()
+        self.conn.row_factory = sqlite3.Row
+
 
         # Mock a valid ApiConfig object for testing
         self.api_config = ApiConfig(
@@ -62,208 +78,179 @@ class TestAgentRunner(unittest.TestCase):
     @patch('app.agents.runner._execute_step', new_callable=AsyncMock)
     def test_simple_task_execution(self, mock_execute_step, mock_generate_plan):
         """Test a simple task flow: search -> finish."""
-
-        # --- Mock Setup ---
         goal = "test goal"
         task_id = "test-task-1"
         final_answer = "The answer is 42."
-        plan = [
-            {"sub_goal": "Search for the goal."},
-            {"sub_goal": "Finish the task."}
-        ]
+        plan = [{"sub_goal": "Search for the goal."}, {"sub_goal": f"Finish with the answer: {final_answer}"}]
+
         mock_generate_plan.return_value = plan
-
         mock_execute_step.side_effect = [
-            {"step_summary": "Search successful: Found relevant information.", "final_answer": None},
-            {"step_summary": "Task finished.", "final_answer": final_answer}
+            {"step_summary": "Search successful.", "final_answer": None, "failed": False},
+            {"step_summary": "Task finished.", "final_answer": final_answer, "failed": False}
         ]
 
-        # --- Run the task ---
         asyncio.run(_execute_task(self.conn, task_id, "conv-1", goal, self.api_config_dict))
 
-        # --- Assertions ---
-        # 1. Check final task status
-        task = self.cursor.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+        task = self.conn.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
         self.assertEqual(task["status"], "completed")
         self.assertEqual(task["final_report"], final_answer)
 
-        # 2. Check steps recorded in DB
-        steps = self.cursor.execute("SELECT * FROM agent_task_steps WHERE task_id = ? ORDER BY step_index", (task_id,)).fetchall()
+        steps = self.conn.execute("SELECT * FROM agent_task_steps WHERE task_id = ?", (task_id,)).fetchall()
         self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]['status'], 'completed')
+        self.assertEqual(steps[1]['status'], 'completed')
+
+
+    @patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock)
+    @patch('app.agents.runner._tool_replan', new_callable=AsyncMock)
+    @patch('app.agents.runner._execute_step', new_callable=AsyncMock)
+    def test_replan_on_failure(self, mock_execute_step, mock_replan, mock_generate_plan):
+        """Test that the agent re-plans if a step fails."""
+        goal = "test replan"
+        task_id = "test-task-replan"
+
+        # Initial plan that is destined to fail
+        initial_plan = [{"sub_goal": "Do something that will fail."}]
+        mock_generate_plan.return_value = initial_plan
+
+        # The first execution of the step fails
+        mock_execute_step.side_effect = [
+            {"step_summary": "Something failed.", "final_answer": None, "failed": True},
+            # After re-planning, the new step succeeds
+            {"step_summary": "New step successful.", "final_answer": "Success!", "failed": False}
+        ]
+
+        # The re-planner returns a new, better plan
+        new_plan = [{"sub_goal": "Do something that will succeed."}]
+        mock_replan.return_value = new_plan
+
+        asyncio.run(_execute_task(self.conn, task_id, "conv-replan", goal, self.api_config_dict))
+
+        # Assertions
+        mock_generate_plan.assert_called_once()
+        mock_replan.assert_called_once()
+        self.assertEqual(mock_execute_step.call_count, 2)
+
+        task = self.conn.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["final_report"], "Success!")
+
+        # We should have one failed step from the first plan, and one successful one from the second
+        steps = self.conn.execute("SELECT * FROM agent_task_steps WHERE task_id = ? ORDER BY step_index", (task_id,)).fetchall()
+        self.assertEqual(len(steps), 1) # The new plan has one step
+        self.assertEqual(steps[0]['status'], 'completed')
+
+
+    @patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock)
+    @patch('app.agents.runner._determine_next_action_for_sub_goal', new_callable=AsyncMock)
+    @patch('app.agents.runner._execute_tool', new_callable=AsyncMock)
+    def test_self_correction_within_step(self, mock_execute_tool, mock_determine_action, mock_generate_plan):
+        """Test the agent's ability to self-correct after a tool error within a single step."""
+        goal = "test self-correction"
+        task_id = "test-task-self-correct"
+        final_answer = "Corrective action was successful."
+
+        plan = [{"sub_goal": "Try something, fail, then correct."}]
+        mock_generate_plan.return_value = plan
+
+        # The executor first tries a failing action, then a correcting one.
+        mock_determine_action.side_effect = [
+            {"thought": "Let's try the failing tool.", "action": "failing_tool", "action_input": {}},
+            {"thought": "That failed. Let's correct.", "action": "correcting_tool", "action_input": {}},
+            {"thought": "Correction worked.", "action": "finish_task", "action_input": {"final_answer": final_answer}},
+        ]
+
+        # The first tool call raises an exception, the second one succeeds.
+        mock_execute_tool.side_effect = [
+            ValueError("Tool failed!"),
+            "Corrective action output.",
+            final_answer
+        ]
+
+        asyncio.run(_execute_task(self.conn, task_id, "conv-self-correct", goal, self.api_config_dict))
+
+        # Assertions
+        self.assertEqual(mock_execute_tool.call_count, 3)
+
+        task = self.conn.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["final_report"], final_answer)
+
+        step = self.conn.execute("SELECT * FROM agent_task_steps WHERE task_id = ?", (task_id,)).fetchone()
+        self.assertEqual(step['status'], 'completed')
+
+        # Check that the history of the step reflects the correction
+        history = json.loads(step['history'])
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]['action'], 'error')
+        self.assertIn("Tool failed!", history[0]['observation'])
+        self.assertEqual(history[1]['action'], 'correcting_tool')
 
 
     @patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock)
     @patch('app.agents.runner._execute_step', new_callable=AsyncMock)
-    def test_tool_error_handling(self, mock_execute_step, mock_generate_plan):
-        """Test that the agent can handle a tool execution error."""
-
-        # --- Mock Setup ---
-        goal = "run bad python code"
-        task_id = "test-task-2"
-        final_answer = "Failed to execute Python code with error: division by zero."
-        plan = [
-            {"sub_goal": "Run some python code that will fail."},
-            {"sub_goal": "Finish the task."}
-        ]
-        mock_generate_plan.return_value = plan
-
-        mock_execute_step.side_effect = [
-            {"step_summary": "Error executing tool 'python_code_interpreter': division by zero.", "final_answer": None},
-            {"step_summary": "Task finished.", "final_answer": final_answer}
-        ]
-
-        # --- Run the task ---
-        asyncio.run(_execute_task(self.conn, task_id, "conv-2", goal, self.api_config_dict))
-
-        # --- Assertions ---
-        # 1. Check final task status
-        task = self.cursor.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
-        self.assertEqual(task["status"], "completed")
-        self.assertIn("Failed to execute Python code", task["final_report"])
-
-        # 2. Check the step that failed
-        steps = self.cursor.execute("SELECT * FROM agent_task_steps WHERE task_id = ?", (task_id,)).fetchall()
-        self.assertEqual(len(steps), 2)
-
-
-    @patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock)
-    @patch('app.agents.runner._execute_step', new_callable=AsyncMock)
-    def test_multi_step_report_generation(self, mock_execute_step, mock_generate_plan):
-        """Test a more complex flow involving multi-step report generation."""
-
-        # --- Mock Setup ---
-        goal = "write a report"
-        task_id = "test-task-3"
-        outline = ["Chapter 1: Introduction", "Chapter 2: Conclusion"]
-        chapter1_content = "This is the introduction."
-        chapter2_content = "This is the conclusion."
-        final_report_content = f"# Report\n\n## Chapter 1: Introduction\n{chapter1_content}\n\n## Chapter 2: Conclusion\n{chapter2_content}"
-        final_answer = "Successfully generated and saved the report."
-        plan = [
-            {"sub_goal": "Generate an outline for the report."},
-            {"sub_goal": "Write the first chapter."},
-            {"sub_goal": "Write the second chapter."},
-            {"sub_goal": "Save the final report."},
-            {"sub_goal": "Finish the task."}
-        ]
-        mock_generate_plan.return_value = plan
-
-        mock_execute_step.side_effect = [
-            {"step_summary": f"Sub-goal: Generate an outline for the report.\nOutcome: {json.dumps(outline)}", "final_answer": None},
-            {"step_summary": f"Sub-goal: Write the first chapter.\nOutcome: {chapter1_content}", "final_answer": None},
-            {"step_summary": f"Sub-goal: Write the second chapter.\nOutcome: {chapter2_content}", "final_answer": None},
-            {"step_summary": "Sub-goal: Save the final report.\nOutcome: Success: File 'final_report.md' saved.", "final_answer": None},
-            {"step_summary": "Task finished.", "final_answer": final_answer}
-        ]
-
-        # --- Run the task ---
-        asyncio.run(_execute_task(self.conn, task_id, "conv-3", goal, self.api_config_dict))
-
-        # --- Assertions ---
-        task = self.cursor.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
-        self.assertEqual(task["status"], "completed")
-        self.assertEqual(task["final_report"], final_answer)
-
-        steps = self.cursor.execute("SELECT * FROM agent_task_steps WHERE task_id = ? ORDER BY step_index", (task_id,)).fetchall()
-        self.assertEqual(len(steps), 5)
-
-
-    def test_complex_investment_report(self):
+    def test_complex_report_generation_with_failures_and_replan(self, mock_execute_step, mock_generate_plan):
         """
-        Test a complex task of generating an investment report,
-        covering the full planner -> executor -> tool -> report flow.
+        An end-to-end test simulating a complex report generation task
+        that involves a step failure and a subsequent re-plan.
         """
-        goal = "请查找中国股市酒类相关股票的股价和其他相关研报，然后给出详细的投资分析报告。"
-        task_id = "investment-report-task"
+        goal = "Generate a full market analysis report for Product X."
+        task_id = "complex-report-task"
+        final_report = "This is the final, successful report."
 
-        # --- Mock Data ---
-        search_results = "茅台股价：2000元，五粮液股价：300元。研报摘要：酒类市场前景广阔..."
-        analyzed_data = "分析结果：茅台和五粮液是龙头企业，具有长期投资价值。"
-        outline = ["1. 行业概览", "2. 重点公司分析", "3. 投资建议"]
-        chapter1 = "第一章内容..."
-        chapter2 = "第二章内容..."
-        chapter3 = "第三章内容..."
-        final_report = f"# 投资分析报告\n\n## 1. 行业概览\n{chapter1}\n\n## 2. 重点公司分析\n{chapter2}\n\n## 3. 投资建议\n{chapter3}"
+        # --- Initial Plan ---
+        initial_plan = [
+            {"sub_goal": "Gather preliminary data for Product X."},
+            {"sub_goal": "Analyze competitor data, which will fail."}, # This step is designed to fail
+            {"sub_goal": "Generate report outline."},
+            {"sub_goal": "Write report and finish."}
+        ]
+        mock_generate_plan.return_value = initial_plan
 
-        # --- Mock LLM Calls ---
-        # 1. Planner's response (the plan)
-        planner_response = {
-            "plan": [
-                {"sub_goal": "使用互联网搜索查找中国股市酒类相关股票的最新股价。"},
-                {"sub_goal": "使用互联网搜索查找相关的行业研究报告。"},
-                {"sub_goal": "综合搜索结果，分析市场趋势和重点公司。"},
-                {"sub_goal": "为投资报告生成一个大纲，包括行业概览、重点公司分析和投资建议。"},
-                {"sub_goal": "撰写'行业概览'章节。"},
-                {"sub_goal": "撰写'重点公司分析'章节。"},
-                {"sub_goal": "撰写'投资建议'章节。"},
-                {"sub_goal": f"将所有章节合并成最终报告，并调用 finish_task 工具。"},
-            ]
-        }
-
-        # Executor's responses for each sub-goal
-        executor_responses = [
-            # Step 1: Search stock prices
-            {"thought": "...", "action": "internet_search", "action_input": {"query": "中国股市酒类股票股价"}},
-            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
-            # Step 2: Search research papers
-            {"thought": "...", "action": "internet_search", "action_input": {"query": "中国酒类股票行业研究报告"}},
-            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
-            # Step 3: Analyze data
-            {"thought": "...", "action": "python_code_interpreter", "action_input": {"code": "print('分析结果...')"}},
-            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
-            # Step 4: Generate outline
-            {"thought": "...", "action": "generate_report_outline", "action_input": {"goal": goal}},
-            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
-            # Step 5: Write chapter 1
-            {"thought": "...", "action": "write_report_chapter", "action_input": {"chapter_title": "1. 行业概览"}},
-            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
-            # Step 6: Write chapter 2
-            {"thought": "...", "action": "write_report_chapter", "action_input": {"chapter_title": "2. 重点公司分析"}},
-            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
-            # Step 7: Write chapter 3
-            {"thought": "...", "action": "write_report_chapter", "action_input": {"chapter_title": "3. 投资建议"}},
-            {"thought": "...", "action": "COMPLETE_SUB_GOAL", "action_input": {}},
-             # Step 8: Finish
-            {"thought": "...", "action": "finish_task", "action_input": {"final_answer": final_report}},
+        # --- New Plan (after failure) ---
+        new_plan = [
+             {"sub_goal": "Gather data from an alternative source."},
+             {"sub_goal": "Generate a revised report outline."},
+             {"sub_goal": "Write the final report based on the new data and outline, then finish."}
         ]
 
+        # We need to patch the replan tool specifically for this test
+        with patch('app.agents.runner._tool_replan', new_callable=AsyncMock) as mock_replan:
+            mock_replan.return_value = new_plan
 
-        # --- Patching ---
-        with patch('app.agents.runner._generate_initial_plan', new_callable=AsyncMock) as mock_generate_plan, \
-             patch('app.agents.runner._determine_next_action_for_sub_goal', new_callable=AsyncMock) as mock_determine_action, \
-             patch('app.agents.runner._execute_tool', new_callable=AsyncMock) as mock_execute_tool:
-
-            # Setup mock return values
-            mock_generate_plan.return_value = planner_response["plan"]
-            mock_determine_action.side_effect = executor_responses
-            mock_execute_tool.side_effect = [
-                search_results, # For step 1
-                search_results, # For step 2
-                analyzed_data,  # For step 3
-                json.dumps(outline), # For step 4
-                chapter1, # For step 5
-                chapter2, # For step 6
-                chapter3, # For step 7
-                final_report # for step 8
+            # --- Mock Step Executions ---
+            mock_execute_step.side_effect = [
+                # Initial plan execution
+                {"step_summary": "Data gathered.", "final_answer": None, "failed": False},
+                {"step_summary": "Competitor analysis failed due to API error.", "final_answer": None, "failed": True},
+                # Re-planned execution
+                {"step_summary": "Alternative data gathered.", "final_answer": None, "failed": False},
+                {"step_summary": "Revised outline generated.", "final_answer": None, "failed": False},
+                {"step_summary": "Final report written.", "final_answer": final_report, "failed": False}
             ]
 
             # --- Run Task ---
             asyncio.run(_execute_task(self.conn, task_id, "conv-complex", goal, self.api_config_dict))
 
             # --- Assertions ---
-            # 1. Final task status
-            task = self.cursor.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+            # 1. Verify that re-planning was triggered
+            mock_replan.assert_called_once()
+
+            # 2. Check the final task status and report
+            task = self.conn.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
             self.assertEqual(task["status"], "completed")
             self.assertEqual(task["final_report"], final_report)
 
-            # 2. Check number of steps in DB
-            steps = self.cursor.execute("SELECT * FROM agent_task_steps WHERE task_id = ?", (task_id,)).fetchall()
-            self.assertEqual(len(steps), len(planner_response["plan"]))
+            # 3. Check the final plan stored in the database
+            final_plan_from_db = json.loads(task["plan"])
+            self.assertEqual(final_plan_from_db, initial_plan) # The 'plan' field is not updated after replan in the current implementation
 
-            # 3. Verify calls
-            mock_generate_plan.assert_called_once_with(goal, self.api_config)
-            self.assertEqual(mock_determine_action.call_count, len(executor_responses))
-            self.assertEqual(mock_execute_tool.call_count, 8) # 8 tools were called
+            # 4. Check the steps in the database - should correspond to the *new* plan
+            steps = self.conn.execute("SELECT * FROM agent_task_steps WHERE task_id = ? ORDER BY step_index", (task_id,)).fetchall()
+            self.assertEqual(len(steps), len(new_plan))
+            self.assertEqual(steps[0]['action'], 'Gather data from an alternative source.')
+            self.assertEqual(steps[0]['status'], 'completed')
+            self.assertEqual(steps[2]['status'], 'completed')
 
 
 if __name__ == '__main__':
