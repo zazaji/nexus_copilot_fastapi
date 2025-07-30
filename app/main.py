@@ -33,12 +33,12 @@ app.add_middleware(
 )
 
 # Mount the 'files' directory to serve agent logs and reports
-files_dir = os.path.join(".", "files")
+files_dir = os.path.join(settings.NEXUS_DATA_PATH, "files")
 os.makedirs(files_dir, exist_ok=True)
 app.mount("/files", StaticFiles(directory=files_dir), name="files")
 
 # Mount the 'tasks' directory to serve generated files for preview
-tasks_dir = os.path.join(".", "tasks")
+tasks_dir = os.path.join(settings.NEXUS_DATA_PATH, "tasks")
 os.makedirs(tasks_dir, exist_ok=True)
 app.mount("/tasks", StaticFiles(directory=tasks_dir), name="tasks")
 

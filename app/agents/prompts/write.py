@@ -43,7 +43,7 @@ def build_writer_outline_prompt(context: 'TaskContext', elaboration: str, levels
     """Phase 2: Generate a structured outline with word count allocation."""
     language_instruction = get_language_instruction(context)
     return f"""
-You are a professional writer and editor AI. Your task is to create a detailed, multi-level outline for an article and intelligently allocate the target word count across all sections. {language_instruction}
+You are a professional writer and editor AI. Your task is to create a detailed, multi-level outline for an article and intelligently allocate the target total word count across all sections. {language_instruction}
 
 **User's Goal:** Write an article about "{context.goal}"
 
@@ -100,43 +100,84 @@ You are a professional writer and editor AI. Your task is to create a detailed, 
 Now, generate the JSON outline with word count allocation for the goal: "{context.goal}". Your output must be ONLY the JSON object.
 """
 
-def build_writer_chapter_strategy_prompt(context: 'TaskContext', elaboration: str, outline: str, chapter_title: str) -> str:
-    """Phase 3: Generate the writing strategy for a specific chapter."""
+def build_writer_critique_prompt(context: 'TaskContext', task_description: str, requirements: str, content_to_critique: str) -> str:
+    """Generic critique prompt for any generated content."""
     language_instruction = get_language_instruction(context)
     return f"""
-You are an expert writing strategist. Your task is to devise a clear and concise writing strategy for a specific chapter of an article. {language_instruction}
+You are a meticulous and demanding editor AI. Your task is to critique a piece of generated content to see if it meets a set of strict requirements. {language_instruction}
 
-**Overall Article Goal:** {context.goal}
-
-**Core Strategy & Style:**
+**Overall Goal:** {context.goal}
+**Current Task:** {task_description}
+**Requirements for this task:**
 ---
-{elaboration}
----
-
-**Full Article Outline:**
----
-{outline}
+{requirements}
 ---
 
-**Current Chapter to Strategize:** "{chapter_title}"
+**Content to Critique:**
+---
+{content_to_critique}
+---
 
-**Instructions:**
-Based on all the context provided, formulate a brief (2-3 sentences) writing strategy for this specific chapter. The strategy should guide the writing process to ensure this chapter fits coherently within the overall article structure and achieves its specific purpose.
+**Your Instructions:**
+1.  **Analyze:** Rigorously compare the "Content to Critique" against each point in the "Requirements".
+2.  **Decision:** Determine if the content meets ALL requirements.
+3.  **Feedback:** If it fails, provide specific, actionable feedback on exactly what is missing or needs to be changed. If it passes, state that it meets the requirements.
 
 **Output Format:**
-You MUST provide your response as a single, valid JSON object with one key: "strategy".
+You MUST provide your response as a single, valid JSON object with two keys: "meets_requirements" (a boolean) and "feedback" (a string).
 
-**Example Response:**
+**Example (Failure):**
 -```json
 {{
-  "strategy": "This chapter will introduce the core concepts. It should start by defining the first key concept with clear examples, then transition smoothly to the second key concept, highlighting its relationship to the first."
+  "meets_requirements": false,
+  "feedback": "The generated outline is missing word count allocations for sub-sections 2.1 and 2.2. The total word count also does not sum up to the target of 2000 words."
 }}
 -```
 
-Now, generate the writing strategy for the chapter "{chapter_title}". Your output must be ONLY the JSON object.
+**Example (Success):**
+-```json
+{{
+  "meets_requirements": true,
+  "feedback": "The content successfully meets all specified requirements for this stage."
+}}
+-```
+
+Now, critique the provided content. Your output must be ONLY the JSON object.
 """
 
-def build_writer_section_content_prompt(context: 'TaskContext', elaboration: str, outline: str, chapter_strategy: str, section_title: str, history: str, planned_word_count: int) -> str:
+def build_writer_refine_prompt(context: 'TaskContext', task_description: str, requirements: str, original_content: str, critique_feedback: str) -> str:
+    """Generic refinement prompt for any generated content."""
+    language_instruction = get_language_instruction(context)
+    return f"""
+You are an expert writer AI specializing in revision and refinement. Your task is to rewrite a piece of content based on specific editorial feedback to ensure it meets all requirements. {language_instruction}
+
+**Overall Goal:** {context.goal}
+**Current Task:** {task_description}
+**Original Requirements for this task:**
+---
+{requirements}
+---
+
+**Original Content (that failed critique):**
+---
+{original_content}
+---
+
+**Critique and Feedback to Address:**
+---
+{critique_feedback}
+---
+
+**Your Instructions:**
+Rewrite the "Original Content" to fully address every point in the "Critique and Feedback". The new version must satisfy all of the "Original Requirements".
+
+**Output Format:**
+You MUST provide your response as a single, valid JSON object. The structure of this JSON should be identical to the expected format of the original content (e.g., if you are refining an outline, the output should be `{{ "plan": [...] }}`).
+
+Now, generate the refined content. Your output must be ONLY the JSON object.
+"""
+
+def build_writer_section_content_prompt(context: 'TaskContext', elaboration: str, outline: str, section_title: str, history: str, planned_word_count: int) -> str:
     """Phase 4: Write the content for a specific section with a strong word count constraint."""
     language_instruction = get_language_instruction(context)
     return f"""
@@ -154,11 +195,6 @@ You are an expert writer AI. Your task is to write the content for a specific se
 {outline}
 ---
 
-**Strategy for the Current Chapter:**
----
-{chapter_strategy}
----
-
 **Previously Written Content (History):**
 ---
 {history}
@@ -171,7 +207,7 @@ You MUST write approximately **{planned_word_count} words** for this section. Ad
 
 **Instructions:**
 1.  Write the content for the specified section, respecting the word count constraint.
-2.  The content should be comprehensive, well-structured, and engaging, following the chapter's strategy and the article's overall style.
+2.  The content should be comprehensive, well-structured, and engaging, following the article's overall style.
 3.  The output MUST be in Markdown format.
 4.  Do NOT include the section title (e.g., "### 1.1.1 Core Definition") in your output, only the body content.
 
@@ -188,51 +224,6 @@ You MUST provide your response as a single, valid JSON object with one key: "con
 Now, write the content for the section "{section_title}". Your output must be ONLY the JSON object.
 """
 
-def build_writer_refine_prompt(context: 'TaskContext', section_title: str, original_content: str, planned_word_count: int, current_word_count: int) -> str:
-    """Phase 5: Refine a piece of text, with strong, quantitative instructions on word count."""
-    language_instruction = get_language_instruction(context)
-    
-    word_count_instruction = ""
-    if planned_word_count > 0:
-        ratio_reverse = int(10*(planned_word_count / current_word_count))/10  if planned_word_count > 0 else 1
-
-        if ratio_reverse > 1.25:
-            word_count_instruction = f"The current content is only {current_word_count} words, but the target is {planned_word_count} words. Your primary goal is to **expand the  length of content to {ratio_reverse} times**. Achieve this by adding more details, examples, deeper analysis, or elaborating on the key points."
-        elif ratio_reverse < 0.75:
-            ratio_reverse = int(10*(planned_word_count / current_word_count))/10
-            word_count_instruction = f"The current content is {current_word_count} words, but the target is only {planned_word_count} words. Your primary goal is to **condense the  length of content to {ratio_reverse} times**. Achieve this by removing redundant phrases, combining sentences, and focusing only on the most critical information."
-        else:
-            word_count_instruction = f"The current word count of {current_word_count} is close to the planned {planned_word_count} words. Your primary goal is to **polish the text for clarity, flow, and depth**,focus to the subject, without significantly changing the length."
-
-    return f"""
-You are a master editor AI. Your task is to review and improve the following text for a specific article section, with a primary focus on the word count target. {language_instruction}
-
-**Section Title:** "{section_title}"
-
-**Original Content:**
----
-{original_content}
----
-
-**Primary Editing Goal:**
-{word_count_instruction}
-
-**Secondary Goal:**
-In addition to the word count, improve the content's clarity, flow, and depth. Ensure it is polished and professional. Do not simply rephrase; add value.
-
-**Output Format:**
-You MUST provide your response as a single, valid JSON object with one key: "content".
-
-**Example Response:**
--```json
-{{
-  "content": "The foundational definition of this topic is built upon three interconnected pillars. The first, and most critical, is the principle of..., which dictates that... This contrasts with the second pillar, characterized by..., a concept that emerged in the late 20th century. The third pillar, its practical application, is most vividly demonstrated in the field of..."
-}}
--```
-
-Now, refine the provided content based on your primary editing goal. Your output must be ONLY the JSON object.
-"""
-
 def build_refine_section_prompt(context: 'TaskContext', outline: str, section_title: str, current_content: str, user_prompt: str, planned_word_count: int, current_word_count: int) -> str:
     """Builds a comprehensive prompt for the LLM to refine a specific section based on user input and word count analysis."""
     language_instruction = get_language_instruction(context)
@@ -240,7 +231,6 @@ def build_refine_section_prompt(context: 'TaskContext', outline: str, section_ti
     word_count_instruction = ""
     if planned_word_count > 0:
         ratio = current_word_count / planned_word_count if planned_word_count > 0 else 1
-        diff_percent = abs(ratio - 1) * 100
         if ratio < 0.75:
             word_count_instruction = f"Note: The current section is about {current_word_count} words, which is significantly shorter than the planned {planned_word_count} words. While addressing the user's request, please also try to expand the content with more details or examples."
         elif ratio > 1.25:
