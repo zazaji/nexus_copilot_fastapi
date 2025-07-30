@@ -1,0 +1,44 @@
+name: Archive on Commit
+
+on:
+  push:
+    branches:
+      - main # 或者您的开发分支
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 从文件中读取版本号
+      # 示例：从 VERSION.txt 读取
+      - name: Get version from file
+        id: get_version
+        run: echo "VERSION=$(cat VERSION.txt)" >> $GITHUB_ENV
+        # 如果是从 .py 文件读取，可以用 grep:
+        # run: echo "VERSION=$(grep -oP '__version__ = "\K[^"]+' your_project/__init__.py)" >> $GITHUB_ENV
+
+      # 获取短提交哈希
+      - name: Get short commit hash
+        id: slug
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # 组合最终的存档文件名
+      - name: Define archive name
+        run: echo "ARCHIVE_NAME=my-project-${{ env.VERSION }}-${{ env.sha_short }}.zip" >> $GITHUB_ENV
+
+      - name: Display Archive Name
+        run: echo "Archive name will be ${{ env.ARCHIVE_NAME }}"
+
+      # 创建压缩包
+      - name: Create Zip Archive
+        run: zip -r ${{ env.ARCHIVE_NAME }} . -x ".git/*" ".github/*"
+
+      # 上传构建产物，可从 Actions 页面下载
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-archive # 构建产物的标题
+          path: ${{ env.ARCHIVE_NAME }}
