@@ -11,7 +11,6 @@ import sqlite3
 from app.database import get_db_connection
 from app.schemas.proxy_schemas import ApiConfig
 from app.agents.runner import run_task_background
-from app.agents.modes.research_mode import generate_node_content_background
 from app.agents.modes.refine_mode import refine_section_background
 from app.core.config import settings
 
@@ -144,12 +143,11 @@ async def generate_node_content(payload: GenerateNodeContentRequest, background_
     """
     Triggers the generation of content for a specific node in a research task.
     """
-    background_tasks.add_task(
-        generate_node_content_background,
-        payload.task_id,
-        payload.node_id
-    )
-    return {"message": f"Content generation for node {payload.node_id} has been queued."}
+    # This endpoint is now deprecated in favor of the main write loop, but kept for potential future use.
+    # The new write mode generates content sequentially.
+    # For now, we can log a warning or adapt it if needed.
+    logging.warning("generate-node-content endpoint called, but the new write mode is sequential. This may have no effect.")
+    return {"message": "This endpoint is deprecated for the new sequential write mode."}
 
 @router.post("/refine-section", status_code=202)
 async def refine_section(payload: RefineSectionRequest, background_tasks: BackgroundTasks):

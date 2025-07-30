@@ -86,15 +86,12 @@ async def _execute_task(context: TaskContext, is_resume: bool = False):
             await run_plan_mode(context)
         elif context.mode == 'explore':
             await run_explore_mode(context)
-        elif context.mode == 'write':
+        elif context.mode == 'write' or context.mode == 'research':
             if is_resume:
                 from .modes.write_mode import resume_write_mode
                 await resume_write_mode(context)
             else:
                 await run_write_mode(context)
-        elif context.mode == 'research':
-            from .modes.research_mode import run_research_mode
-            await run_research_mode(context)
         elif context.mode == 'debate':
             await run_debate_mode(context)
 

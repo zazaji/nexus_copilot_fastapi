@@ -188,37 +188,94 @@ You MUST provide your response as a single, valid JSON object with one key: "con
 Now, write the content for the section "{section_title}". Your output must be ONLY the JSON object.
 """
 
-def build_writer_refine_prompt(context: 'TaskContext', section_title: str, original_content: str, planned_word_count: int, current_word_count: int) -> str:
-    """Phase 5: Refine a piece of text, with strong, quantitative instructions on word count."""
+def build_writer_critique_prompt(context: 'TaskContext', section_title: str, content_to_critique: str, elaboration: str, outline: str, planned_word_count: int) -> str:
+    """Generates a prompt for the Critique model to evaluate generated content."""
     language_instruction = get_language_instruction(context)
-    
-    word_count_instruction = ""
-    if planned_word_count > 0:
-        ratio_reverse = int(10*(planned_word_count / current_word_count))/10  if planned_word_count > 0 else 1
-
-        if ratio_reverse > 1.25:
-            word_count_instruction = f"The current content is only {current_word_count} words, but the target is {planned_word_count} words. Your primary goal is to **expand the  length of content to {ratio_reverse} times**. Achieve this by adding more details, examples, deeper analysis, or elaborating on the key points."
-        elif ratio_reverse < 0.75:
-            ratio_reverse = int(10*(planned_word_count / current_word_count))/10
-            word_count_instruction = f"The current content is {current_word_count} words, but the target is only {planned_word_count} words. Your primary goal is to **condense the  length of content to {ratio_reverse} times**. Achieve this by removing redundant phrases, combining sentences, and focusing only on the most critical information."
-        else:
-            word_count_instruction = f"The current word count of {current_word_count} is close to the planned {planned_word_count} words. Your primary goal is to **polish the text for clarity, flow, and depth**,focus to the subject, without significantly changing the length."
-
     return f"""
-You are a master editor AI. Your task is to review and improve the following text for a specific article section, with a primary focus on the word count target. {language_instruction}
+You are a meticulous and demanding editor AI. Your task is to critique a piece of writing for a specific section of a larger article. You must be strict and objective. {language_instruction}
 
-**Section Title:** "{section_title}"
+**Overall Article Goal:** {context.goal}
+**Core Strategy & Style:**
+---
+{elaboration}
+---
+**Full Article Outline:**
+---
+{outline}
+---
 
-**Original Content:**
+**Section Being Evaluated:** "{section_title}"
+**Planned Word Count for this Section:** {planned_word_count} words
+
+**Content to Critique:**
+---
+{content_to_critique}
+---
+
+**Your Task:**
+Evaluate the "Content to Critique" based on the following criteria. For each criterion, provide a score from 1 (poor) to 10 (excellent).
+1.  **Relevance & Focus:** Does the content directly address the topic of "{section_title}" and fit within the overall outline?
+2.  **Completeness & Depth:** Is the content sufficiently detailed and comprehensive for a high-quality article? Does it answer the implicit questions of the section title?
+3.  **Clarity & Logic:** Is the writing clear, well-structured, and logically coherent?
+4.  **Style Adherence:** Does the tone and style match the required style: "{elaboration.split('Style: ')[1].splitlines()[0]}"?
+5.  **Word Count Adherence:** How well does the actual word count ({len(content_to_critique.split())}) match the planned word count ({planned_word_count})? A deviation of more than 25% should result in a low score.
+
+After scoring, provide a final "overall_assessment" (a brief summary of your critique) and a boolean "passed" flag. The task **only passes if ALL scores are 8 or higher**.
+
+**Output Format:**
+You MUST provide your response as a single, valid JSON object.
+
+**Example Response:**
+-```json
+{{
+  "scores": {{
+    "relevance_and_focus": 9,
+    "completeness_and_depth": 6,
+    "clarity_and_logic": 8,
+    "style_adherence": 9,
+    "word_count_adherence": 7
+  }},
+  "overall_assessment": "The content is well-written and relevant, but it lacks sufficient depth and detail. It needs more examples to meet the section's requirements. The word count is slightly low.",
+  "passed": false
+}}
+-```
+
+Now, critique the provided content. Your output must be ONLY the JSON object.
+"""
+
+def build_writer_refine_prompt(context: 'TaskContext', section_title: str, original_content: str, critique: str, elaboration: str, outline: str) -> str:
+    """Builds a prompt for the Refine model, incorporating feedback from the Critique model."""
+    language_instruction = get_language_instruction(context)
+    return f"""
+You are a master writer and editor AI. Your task is to rewrite and improve a piece of text based on specific editorial feedback. {language_instruction}
+
+**Overall Article Goal:** {context.goal}
+**Core Strategy & Style:**
+---
+{elaboration}
+---
+**Full Article Outline:**
+---
+{outline}
+---
+
+**Section to Refine:** "{section_title}"
+
+**Original Content (to be improved):**
 ---
 {original_content}
 ---
 
-**Primary Editing Goal:**
-{word_count_instruction}
+**Editor's Critique and Instructions (You MUST address these points):**
+---
+{critique}
+---
 
-**Secondary Goal:**
-In addition to the word count, improve the content's clarity, flow, and depth. Ensure it is polished and professional. Do not simply rephrase; add value.
+**Your Task:**
+Rewrite the "Original Content" to fully address all points raised in the "Editor's Critique".
+- The new version should be a complete replacement for the original.
+- The output MUST be in Markdown format.
+- Do NOT include the section title in your output, only the revised body content.
 
 **Output Format:**
 You MUST provide your response as a single, valid JSON object with one key: "content".
@@ -226,11 +283,11 @@ You MUST provide your response as a single, valid JSON object with one key: "con
 **Example Response:**
 -```json
 {{
-  "content": "The foundational definition of this topic is built upon three interconnected pillars. The first, and most critical, is the principle of..., which dictates that... This contrasts with the second pillar, characterized by..., a concept that emerged in the late 20th century. The third pillar, its practical application, is most vividly demonstrated in the field of..."
+  "content": "The newly revised and improved content goes here. It directly incorporates the feedback from the critique, adding more depth and examples as requested, while also adjusting the word count."
 }}
 -```
 
-Now, refine the provided content based on your primary editing goal. Your output must be ONLY the JSON object.
+Now, generate the refined content. Your output must be ONLY the JSON object.
 """
 
 def build_refine_section_prompt(context: 'TaskContext', outline: str, section_title: str, current_content: str, user_prompt: str, planned_word_count: int, current_word_count: int) -> str:
@@ -240,7 +297,6 @@ def build_refine_section_prompt(context: 'TaskContext', outline: str, section_ti
     word_count_instruction = ""
     if planned_word_count > 0:
         ratio = current_word_count / planned_word_count if planned_word_count > 0 else 1
-        diff_percent = abs(ratio - 1) * 100
         if ratio < 0.75:
             word_count_instruction = f"Note: The current section is about {current_word_count} words, which is significantly shorter than the planned {planned_word_count} words. While addressing the user's request, please also try to expand the content with more details or examples."
         elif ratio > 1.25:
