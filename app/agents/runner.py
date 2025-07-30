@@ -44,7 +44,7 @@ async def _synthesize_final_report(context: TaskContext) -> str:
     logging.info(f"[{context.task_id}] Starting final synthesis step.")
     
     # Gather all generated content
-    if context.mode == 'write':
+    if context.mode in ['write', 'research']:
         from .context import _assemble_final_report
         history = _assemble_final_report(context)
         # For write/research, the assembled report is the final report. No extra LLM call needed.
@@ -92,6 +92,9 @@ async def _execute_task(context: TaskContext, is_resume: bool = False):
                 await resume_write_mode(context)
             else:
                 await run_write_mode(context)
+        elif context.mode == 'research':
+            from .modes.research_mode import run_research_mode
+            await run_research_mode(context)
         elif context.mode == 'debate':
             await run_debate_mode(context)
 
